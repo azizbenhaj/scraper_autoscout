@@ -146,20 +146,36 @@ def create_session(proxy: str | None, *, accept_language: str) -> requests.Sessi
     return session
 
 
+@dataclass
+class SeedCookieState:
+    """Post–warm-up cookies copied into each worker Session when using thread-local factories."""
+
+    jar: requests.cookies.RequestsCookieJar | None = None
+
+
 class ThreadLocalSessionFactory:
     """requests.Session is not thread-safe; use one session per worker thread."""
 
-    __slots__ = ("_accept_language", "_local", "_proxy")
+    __slots__ = ("_accept_language", "_local", "_proxy", "_seed_state")
 
-    def __init__(self, proxy: str | None, *, accept_language: str) -> None:
+    def __init__(
+        self,
+        proxy: str | None,
+        *,
+        accept_language: str,
+        seed_state: SeedCookieState | None = None,
+    ) -> None:
         self._proxy = proxy
         self._accept_language = accept_language
+        self._seed_state = seed_state
         self._local = threading.local()
 
     def __call__(self) -> requests.Session:
         s = getattr(self._local, "session", None)
         if s is None:
             s = create_session(self._proxy, accept_language=self._accept_language)
+            if self._seed_state is not None and self._seed_state.jar is not None:
+                s.cookies.update(self._seed_state.jar)
             self._local.session = s
         return s
 
@@ -430,6 +446,51 @@ def search_list_url(
     return u
 
 
+def site_origin_referer(profile: SiteProfile) -> str:
+    """Locale home used as Referer / warm-up; Swiss search HTML is under /de/."""
+    if profile.key == "ch":
+        return f"https://{profile.base_netloc}/de/"
+    return f"https://{profile.base_netloc}/"
+
+
+def html_navigation_headers(*, dest_url: str, referer: str | None) -> dict[str, str]:
+    """Chrome-like document navigation hints; missing Referer on page 1 often trips Akamai on .ch."""
+    sec_site = "none"
+    if referer:
+        du, ru = urlparse(dest_url), urlparse(referer)
+        sec_site = "same-origin" if du.netloc == ru.netloc else "cross-site"
+    h: dict[str, str] = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": sec_site,
+        "Sec-Fetch-User": "?1",
+    }
+    if referer:
+        h["Referer"] = referer
+    return h
+
+
+def seed_browser_session(
+    session: requests.Session,
+    profile: SiteProfile,
+    delay: tuple[float, float],
+) -> None:
+    """GET locale home first so the first /lst request is not a cold direct hit."""
+    polite_sleep(*delay)
+    origin = site_origin_referer(profile)
+    h = html_navigation_headers(dest_url=origin, referer=None)
+    try:
+        r = session.get(origin, headers=h, timeout=35)
+    except RequestException:
+        return
+    if r.status_code >= 400:
+        return
+
+
 def _fetch_search_page_listings(
     session_factory: Callable[[], requests.Session],
     profile: SiteProfile,
@@ -456,10 +517,9 @@ def _fetch_search_page_listings(
         freg_from=freg_from,
         freg_to=freg_to,
     )
-    headers: dict[str, str] = {}
     if page > 1:
         if price_lo is not None and price_hi is not None:
-            headers["Referer"] = search_list_url(
+            referer = search_list_url(
                 profile,
                 page - 1,
                 price_lo=price_lo,
@@ -471,7 +531,10 @@ def _fetch_search_page_listings(
             )
         else:
             hp = referer_profile or profile
-            headers["Referer"] = hp.listings_base_url + f"&page={page - 1}"
+            referer = hp.listings_base_url + f"&page={page - 1}"
+    else:
+        referer = site_origin_referer(profile)
+    headers = html_navigation_headers(dest_url=url, referer=referer)
     rr = sess.get(url, headers=headers, timeout=35)
     if rr.status_code == 403:
         raise RuntimeError("HTTP 403 while fetching a search results page.")
@@ -641,10 +704,20 @@ def catalog_partition_collect_rows(
         freg_from=freg_from,
         freg_to=freg_to,
     )
-    r = session.get(url, timeout=35)
+    nav_headers = html_navigation_headers(dest_url=url, referer=site_origin_referer(profile))
+    r: requests.Response | None = None
+    for attempt in range(3):
+        r = session.get(url, headers=nav_headers, timeout=35)
+        if r.status_code != 403:
+            break
+        if attempt < 2:
+            polite_sleep(delay[0] * (2.0 + attempt), delay[1] * (4.0 + attempt))
+            seed_browser_session(session, profile, delay)
+    assert r is not None
     if r.status_code == 403:
         raise RuntimeError(
-            "HTTP 403 during catalog partition (blocked). Use slower delays or a residential proxy."
+            "HTTP 403 during catalog partition (blocked). "
+            "Try --delay-min/--delay-max 2–6, --concurrency 1, or --proxy for a residential IP."
         )
     r.raise_for_status()
     blob = extract_next_data(r.text)
@@ -1018,7 +1091,11 @@ def scrape_listing_detail(
     )
     polite_sleep(*delay)
     try:
-        r = session.get(listing_url, timeout=40)
+        dheaders = html_navigation_headers(
+            dest_url=listing_url,
+            referer=profile.listings_base_url,
+        )
+        r = session.get(listing_url, headers=dheaders, timeout=40)
     except RequestException:
         return _detail_fallback_row(listing_url, search_row)
     if r.status_code == 403:
@@ -1394,11 +1471,16 @@ def main() -> None:
             culture=culture,
         )
     session = create_session(args.proxy, accept_language=accept_language)
+    cookie_seed = SeedCookieState()
     session_factory: Callable[[], requests.Session]
     if concurrency <= 1:
         session_factory = lambda s=session: s
     else:
-        session_factory = ThreadLocalSessionFactory(args.proxy, accept_language=accept_language)
+        session_factory = ThreadLocalSessionFactory(
+            args.proxy,
+            accept_language=accept_language,
+            seed_state=cookie_seed,
+        )
 
     if args.catalog_price_min > args.catalog_price_max:
         raise SystemExit("--catalog-price-min cannot exceed --catalog-price-max.")
@@ -1490,6 +1572,14 @@ def main() -> None:
                 f"in-memory URLs now {len(card_rows)} (same listing_url: values from --out win).",
                 flush=True,
             )
+
+    needs_http = (not args.csv_only) or (not args.no_details)
+    if needs_http:
+        seed_browser_session(session, profile, delay)
+        if concurrency > 1:
+            jar = requests.cookies.RequestsCookieJar()
+            jar.update(session.cookies)
+            cookie_seed.jar = jar
 
     if args.csv_only:
         if not card_rows:
